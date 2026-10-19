@@ -6,10 +6,18 @@ Transcrição:        faster-whisper (modelos Whisper)
 Separação de voz:   sherpa-onnx (pyannote segmentation + embeddings de voz)
 """
 
+import logging
+import os
+import platform
 import queue
+import subprocess
+import sys
 import tarfile
 import threading
+import traceback
 import urllib.request
+from importlib import metadata
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -48,6 +56,73 @@ COR_BORDA = "#44444f"
 COR_TEXTO = "#e6e6ea"
 COR_DESABILITADO = "#80808c"
 COR_ACENTO = "#6c8cff"
+
+# ----------------------------------------------------------------------
+# Logs (arquivo em ~/.escriba/logs/escriba.log)
+# ----------------------------------------------------------------------
+PASTA_LOGS = Path.home() / ".escriba" / "logs"
+ARQ_LOG = PASTA_LOGS / "escriba.log"
+
+
+class _SaidaParaLog:
+    """Substitui stdout/stderr quando não há console (modo --windowed)."""
+
+    def __init__(self, nivel):
+        self.nivel = nivel
+
+    def write(self, texto):
+        texto = texto.strip()
+        if texto:
+            logging.log(self.nivel, texto)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def configurar_logs():
+    PASTA_LOGS.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        ARQ_LOG, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s: %(message)s")
+    )
+    raiz = logging.getLogger()
+    raiz.setLevel(logging.DEBUG)
+    raiz.addHandler(handler)
+
+    # Se o programa foi aberto por um terminal, mostra os logs nele também
+    if sys.stderr is not None:
+        console = logging.StreamHandler(sys.stderr)
+        console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        raiz.addHandler(console)
+
+    # Sem console, stdout/stderr são None e algumas bibliotecas quebram ao escrever
+    if sys.stderr is None:
+        sys.stderr = _SaidaParaLog(logging.WARNING)
+    if sys.stdout is None:
+        sys.stdout = _SaidaParaLog(logging.INFO)
+
+    # Registra qualquer exceção não tratada, inclusive em threads
+    sys.excepthook = lambda t, v, tb: logging.critical(
+        "Exceção não tratada", exc_info=(t, v, tb)
+    )
+    threading.excepthook = lambda a: logging.critical(
+        "Exceção não tratada na thread", exc_info=(a.exc_type, a.exc_value, a.exc_traceback)
+    )
+
+    logging.info("=== Escriba iniciado ===")
+    logging.info("Python %s | %s", sys.version.split()[0], platform.platform())
+    logging.info("Executável PyInstaller: %s", getattr(sys, "frozen", False))
+    for pacote in ("faster-whisper", "ctranslate2", "av", "sherpa-onnx", "numpy", "onnxruntime"):
+        try:
+            versao = metadata.version(pacote)
+        except metadata.PackageNotFoundError:
+            versao = "NÃO ENCONTRADO"
+        logging.info("Pacote %s: %s", pacote, versao)
 
 
 # ----------------------------------------------------------------------
@@ -120,7 +195,14 @@ def falante_do_trecho(inicio, fim, turnos, anterior):
 
 def processar(caminho, modelo, idioma, n_falantes, usar_gpu, separar, saida):
     """Roda em thread separada; comunica com a interface via fila."""
-    log = lambda msg: saida.put(("log", msg))
+    def log(msg):
+        logging.info(msg)
+        saida.put(("log", msg))
+
+    logging.info(
+        "Iniciando: arquivo=%s modelo=%s idioma=%s falantes=%s gpu=%s separar=%s",
+        caminho, modelo, idioma, n_falantes, usar_gpu, separar,
+    )
     try:
         from faster_whisper import WhisperModel, decode_audio
 
@@ -149,6 +231,7 @@ def processar(caminho, modelo, idioma, n_falantes, usar_gpu, separar, saida):
             try:
                 turnos = separar_falantes(audio, n_falantes, log)
             except Exception as e:  # segue sem falantes em vez de perder o texto
+                logging.exception("Falha na separação de falantes")
                 log(f"Aviso: não foi possível separar falantes ({e}).")
 
         # Junta trechos consecutivos do mesmo falante em blocos
@@ -165,7 +248,8 @@ def processar(caminho, modelo, idioma, n_falantes, usar_gpu, separar, saida):
         saida.put(("prog", 100))
         saida.put(("pronto", blocos))
     except Exception as e:
-        saida.put(("erro", str(e)))
+        logging.exception("Erro durante a transcrição")
+        saida.put(("erro", f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"))
 
 
 def rotulo(spk):
@@ -290,6 +374,8 @@ class App(tk.Tk):
         self.btn_srt = ttk.Button(acoes, text="Salvar .srt", state="disabled",
                                   command=lambda: self._salvar("srt"))
         self.btn_srt.pack(side="left")
+        ttk.Button(acoes, text="Abrir pasta de logs",
+                   command=self._abrir_logs).pack(side="right")
 
         self.barra = ttk.Progressbar(self, maximum=100)
         self.barra.pack(fill="x", padx=10, pady=(6, 0))
@@ -310,6 +396,15 @@ class App(tk.Tk):
         self.texto.configure(yscrollcommand=rolagem.set)
         rolagem.pack(side="right", fill="y")
         self.texto.pack(side="left", fill="both", expand=True)
+
+    def _abrir_logs(self):
+        PASTA_LOGS.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(PASTA_LOGS)  # Windows
+        except AttributeError:
+            subprocess.Popen(
+                ["open" if sys.platform == "darwin" else "xdg-open", str(PASTA_LOGS)]
+            )
 
     def _escolher(self):
         caminho = filedialog.askopenfilename(
@@ -356,7 +451,13 @@ class App(tk.Tk):
                 elif tipo == "erro":
                     self.status.config(text="Erro.")
                     self.btn_iniciar.config(state="normal")
-                    messagebox.showerror("Escriba", dado)
+                    self.texto.delete("1.0", "end")
+                    self.texto.insert("1.0", "ERRO (copie tudo abaixo):\n\n" + dado)
+                    messagebox.showerror(
+                        "Escriba",
+                        dado.splitlines()[0]
+                        + "\n\nO erro completo está na caixa de texto da janela.",
+                    )
         except queue.Empty:
             pass
         self.after(100, self._ler_fila)
@@ -374,4 +475,5 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    configurar_logs()
     App().mainloop()

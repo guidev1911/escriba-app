@@ -1,3 +1,4 @@
 faster-whisper
+av<17
 sherpa-onnx
 numpy
