@@ -1,0 +1,52 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Ambientes virtuais ---
+.venv/
+venv/
+env/
+
+# --- PyInstaller (gerado pelo build.bat) ---
+build/
+dist/
+*.spec
+
+# --- Modelos de IA (são baixados automaticamente, são grandes) ---
+.escriba/
+*.onnx
+*.bin
+*.gguf
+*.tar.bz2
+models/
+modelos/
+
+# --- Arquivos de teste (áudio, vídeo e resultados) ---
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.ogg
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.srt
+
+# --- Editores e IDEs ---
+.vscode/
+.idea/
+*.swp
+
+# --- Sistema operacional ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Segredos e configurações locais ---
+.env
+*.log
