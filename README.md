@@ -10,6 +10,7 @@ Transcrição de áudio em texto com separação de falantes, com interface grá
 - Aceita áudio e vídeo (mp3, wav, m4a, flac, ogg, mp4, mkv, webm, mov)
 - Detecção automática de idioma ou idioma escolhido manualmente
 - Exporta em `.txt` e `.srt` (legenda com tempos)
+- Converte áudio e vídeo para MP3, M4A, MP4 (áudio), WAV, OGG, OPUS e FLAC
 - Suporte opcional a GPU Nvidia (CUDA)
 
 Exemplo de resultado:

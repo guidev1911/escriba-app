@@ -42,6 +42,18 @@ ARQ_SEGMENTACAO = PASTA_MODELOS / "sherpa-onnx-pyannote-segmentation-3-0" / "mod
 ARQ_EMBEDDING = PASTA_MODELOS / "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
 
 MODELOS_WHISPER = ["tiny", "base", "small", "medium", "large-v3"]
+
+# Formatos disponíveis na conversão: nome -> (extensão, codec, bitrate em bits/s)
+FORMATOS_SAIDA = {
+    "MP3": ("mp3", "libmp3lame", 192_000),
+    "M4A (AAC)": ("m4a", "aac", 192_000),
+    "MP4 (áudio AAC)": ("mp4", "aac", 192_000),
+    "WAV": ("wav", "pcm_s16le", None),
+    "OGG (Vorbis)": ("ogg", "libvorbis", 160_000),
+    "OPUS": ("opus", "libopus", 96_000),
+    "FLAC": ("flac", "flac", None),
+}
+TAXAS_MP3 = {8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000}
 IDIOMAS = {
     "Automático": None, "Português": "pt", "Inglês": "en", "Espanhol": "es",
     "Francês": "fr", "Alemão": "de", "Italiano": "it",
@@ -252,6 +264,60 @@ def processar(caminho, modelo, idioma, n_falantes, usar_gpu, separar, saida):
         saida.put(("erro", f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"))
 
 
+def converter_audio(origem, destino, codec, bitrate, saida):
+    """Converte áudio/vídeo para outro formato de áudio.
+    Usa o PyAV (já instalado junto do faster-whisper), sem precisar do ffmpeg."""
+
+    def log(msg):
+        logging.info(msg)
+        saida.put(("log", msg))
+
+    logging.info("Conversão: %s -> %s (codec=%s, bitrate=%s)", origem, destino, codec, bitrate)
+    try:
+        import av
+
+        log("Convertendo...")
+        with av.open(str(origem)) as entrada:
+            audio_in = next((s for s in entrada.streams if s.type == "audio"), None)
+            if audio_in is None:
+                raise ValueError("O arquivo não tem faixa de áudio.")
+
+            taxa = audio_in.codec_context.sample_rate or 44100
+            if codec == "libopus":
+                taxa = 48000
+            elif codec == "libmp3lame" and taxa not in TAXAS_MP3:
+                taxa = 44100
+            try:
+                canais = audio_in.channels
+            except Exception:
+                canais = len(audio_in.layout.channels)
+            total = entrada.duration / 1_000_000 if entrada.duration else None
+
+            with av.open(str(destino), "w") as saida_av:
+                audio_out = saida_av.add_stream(codec, rate=taxa)
+                try:
+                    audio_out.layout = "mono" if canais == 1 else "stereo"
+                except Exception:
+                    logging.warning("Não foi possível definir o layout de canais")
+                if bitrate:
+                    audio_out.bit_rate = bitrate
+
+                for frame in entrada.decode(audio_in):
+                    for pacote in audio_out.encode(frame):
+                        saida_av.mux(pacote)
+                    if total and frame.time is not None:
+                        saida.put(("prog", min(frame.time / total, 1.0) * 100))
+                for pacote in audio_out.encode(None):  # descarrega o que sobrou
+                    saida_av.mux(pacote)
+
+        saida.put(("prog", 100))
+        saida.put(("conv_ok", str(destino)))
+    except Exception as e:
+        logging.exception("Erro na conversão")
+        Path(destino).unlink(missing_ok=True)  # não deixa arquivo pela metade
+        saida.put(("conv_erro", f"{type(e).__name__}: {e}"))
+
+
 def rotulo(spk):
     return "" if spk is None else f"Falante {spk + 1}: "
 
@@ -364,6 +430,15 @@ class App(tk.Tk):
         ttk.Checkbutton(opcoes2, text="Usar GPU Nvidia (CUDA)",
                         variable=self.gpu).pack(side="left")
 
+        conv = ttk.Frame(self, padding=(10, 0, 10, 6))
+        conv.pack(fill="x")
+        ttk.Label(conv, text="Converter áudio para:").pack(side="left")
+        self.formato_saida = tk.StringVar(value="MP3")
+        ttk.Combobox(conv, textvariable=self.formato_saida, values=list(FORMATOS_SAIDA),
+                     width=16, state="readonly").pack(side="left", padx=6)
+        self.btn_converter = ttk.Button(conv, text="Converter...", command=self._converter)
+        self.btn_converter.pack(side="left")
+
         acoes = ttk.Frame(self, padding=(10, 4))
         acoes.pack(fill="x")
         self.btn_iniciar = ttk.Button(acoes, text="Transcrever", command=self._iniciar)
@@ -415,12 +490,38 @@ class App(tk.Tk):
         if caminho:
             self.arquivo.set(caminho)
 
+    def _converter(self):
+        origem = Path(self.arquivo.get())
+        if not origem.is_file():
+            messagebox.showwarning("Escriba", "Escolha um arquivo válido primeiro.")
+            return
+        ext, codec, bitrate = FORMATOS_SAIDA[self.formato_saida.get()]
+        destino = filedialog.asksaveasfilename(
+            title="Salvar áudio convertido",
+            defaultextension=f".{ext}", initialfile=f"{origem.stem}.{ext}",
+            filetypes=[(ext.upper(), f"*.{ext}")],
+        )
+        if not destino:
+            return
+        if Path(destino).resolve() == origem.resolve():
+            messagebox.showwarning("Escriba", "O destino não pode ser o próprio arquivo de origem.")
+            return
+        self.btn_converter.config(state="disabled")
+        self.btn_iniciar.config(state="disabled")
+        self.barra["value"] = 0
+        threading.Thread(
+            target=converter_audio,
+            args=(origem, Path(destino), codec, bitrate, self.fila),
+            daemon=True,
+        ).start()
+
     def _iniciar(self):
         caminho = Path(self.arquivo.get())
         if not caminho.is_file():
             messagebox.showwarning("Escriba", "Escolha um arquivo válido primeiro.")
             return
         self.btn_iniciar.config(state="disabled")
+        self.btn_converter.config(state="disabled")
         self.btn_txt.config(state="disabled")
         self.btn_srt.config(state="disabled")
         self.texto.delete("1.0", "end")
@@ -446,11 +547,13 @@ class App(tk.Tk):
                     self.texto.insert("1.0", formatar_txt(dado))
                     self.status.config(text="Pronto!")
                     self.btn_iniciar.config(state="normal")
+                    self.btn_converter.config(state="normal")
                     self.btn_txt.config(state="normal")
                     self.btn_srt.config(state="normal")
                 elif tipo == "erro":
                     self.status.config(text="Erro.")
                     self.btn_iniciar.config(state="normal")
+                    self.btn_converter.config(state="normal")
                     self.texto.delete("1.0", "end")
                     self.texto.insert("1.0", "ERRO (copie tudo abaixo):\n\n" + dado)
                     messagebox.showerror(
@@ -458,6 +561,15 @@ class App(tk.Tk):
                         dado.splitlines()[0]
                         + "\n\nO erro completo está na caixa de texto da janela.",
                     )
+                elif tipo == "conv_ok":
+                    self.status.config(text=f"Convertido e salvo em {dado}")
+                    self.btn_iniciar.config(state="normal")
+                    self.btn_converter.config(state="normal")
+                elif tipo == "conv_erro":
+                    self.status.config(text="Erro na conversão.")
+                    self.btn_iniciar.config(state="normal")
+                    self.btn_converter.config(state="normal")
+                    messagebox.showerror("Escriba", f"Não foi possível converter:\n{dado}")
         except queue.Empty:
             pass
         self.after(100, self._ler_fila)
